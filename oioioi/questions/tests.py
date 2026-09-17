@@ -1,5 +1,5 @@
 from copy import deepcopy
-from datetime import UTC, datetime  # pylint: disable=E0611
+from datetime import UTC, datetime, timedelta  # pylint: disable=E0611
 
 try:
     from unittest import mock
@@ -14,6 +14,7 @@ from oioioi.base.notification import NotificationHandler
 from oioioi.base.tests import TestCase, check_not_accessible, fake_time
 from oioioi.base.tests.tests import TestPublicMessage
 from oioioi.contests.models import Contest, ProblemInstance
+from oioioi.participants.models import Participant
 from oioioi.programs.controllers import ProgrammingContestController
 from oioioi.questions.forms import FilterMessageForm
 from oioioi.questions.management.commands.mailnotifyd import (
@@ -22,6 +23,7 @@ from oioioi.questions.management.commands.mailnotifyd import (
 )
 from oioioi.questions.models import AddQuestionMessage, Message, NewsMessage, ReplyTemplate
 from oioioi.questions.utils import unanswered_questions
+from oioioi.usergroups.models import UserGroup
 
 from .views import visible_messages
 
@@ -669,6 +671,242 @@ class TestQuestions(TestCase):
             message = Message.objects.get(pk=4)
             mailnotify(message)
             self.assertEqual(len(mail.outbox), 0)
+
+
+class TestPrivateMessages(TestCase):
+    fixtures = ["test_users", "test_contest", "test_participant"]
+
+    def setUp(self):
+        super().setUp()
+        self.contest = Contest.objects.get()
+        self.admin = User.objects.get(username="test_admin")
+        self.recipient_a = User.objects.get(username="test_user")
+        self.recipient_b = User.objects.get(username="test_user2")
+        self.inactive_participant = User.objects.get(username="test_user3")
+        self.outsider = User.objects.get(username="test_admin2")
+        self.other_participant = User.objects.create(username="other_participant")
+
+        Participant.objects.create(contest=self.contest, user=self.recipient_b)
+        Participant.objects.create(contest=self.contest, user=self.inactive_participant, status="BANNED")
+        Participant.objects.create(contest=self.contest, user=self.other_participant)
+
+        self.group = self._create_group("contest group", self.recipient_a, self.recipient_b, self.inactive_participant)
+
+    def _create_group(self, name, *members):
+        group = UserGroup.objects.create(name=name)
+        group.owners.add(self.admin)
+        group.members.add(*members)
+        group.contests.add(self.contest)
+        return group
+
+    def _private_message_url(self):
+        return reverse("add_private_message", kwargs={"contest_id": self.contest.id})
+
+    def _private_message_data(self, topic, recipient=None, groups=(), pub_date=None):
+        data = {
+            "category": "r_1",
+            "recipient": recipient.username if recipient else "",
+            "groups": [group.id for group in groups],
+            "topic": topic,
+            "content": f"{topic}-body",
+        }
+        if pub_date is not None:
+            data["pub_date"] = pub_date.strftime("%Y-%m-%d %H:%M:%S")
+        return data
+
+    def _send_private_message(self, topic, **kwargs):
+        return self.client.post(self._private_message_url(), self._private_message_data(topic, **kwargs))
+
+    def _edit_private_message(self, message, recipient=None, groups=()):
+        self.client.get(f"/c/{self.contest.id}/")
+        url = reverse("oioioiadmin:questions_message_change", args=(message.id,))
+        data = self._private_message_data(message.topic, recipient=recipient, groups=groups, pub_date=message.pub_date)
+        data["kind"] = "PRIVATE"
+        return self.client.post(url, data)
+
+    def _reply(self, username, url, topic):
+        self.assertTrue(self.client.login(username=username))
+        response = self.client.post(
+            url,
+            {
+                "kind": "PRIVATE",
+                "topic": topic,
+                "content": f"{topic}-body",
+                "save_template": False,
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        return Message.objects.get(topic=topic)
+
+    def test_admin_can_send_private_message_to_participant(self):
+        self.assertTrue(self.client.login(username="test_admin"))
+        response = self.client.get(self._private_message_url())
+        self.assertEqual(response.status_code, 200)
+
+        response = self._send_private_message("private-message", recipient=self.recipient_a)
+        self.assertEqual(response.status_code, 302)
+
+        message = Message.objects.get(topic="private-message")
+        self.assertEqual(message.author, self.admin)
+        self.assertEqual(message.kind, "PRIVATE")
+        self.assertIsNone(message.top_reference)
+        self.assertEqual(message.contest, self.contest)
+        self.assertQuerySetEqual(message.recipients.all(), [self.recipient_a])
+
+    def test_only_admin_can_send_private_message(self):
+        self.assertTrue(self.client.login(username="test_user"))
+        check_not_accessible(self, self._private_message_url())
+        response = self._send_private_message("forbidden-private-message", recipient=self.recipient_a)
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(Message.objects.filter(topic="forbidden-private-message").exists())
+
+    def test_groups_are_expanded_and_recipients_are_deduplicated(self):
+        second_group = self._create_group("second contest group", self.recipient_b, self.other_participant, self.outsider)
+        self.assertTrue(self.client.login(username="test_admin"))
+
+        response = self._send_private_message("private-group-message", recipient=self.recipient_a, groups=(self.group, second_group))
+        self.assertEqual(response.status_code, 302)
+
+        message = Message.objects.get(topic="private-group-message")
+        self.assertQuerySetEqual(message.recipients.order_by("username"), [self.other_participant, self.recipient_a, self.recipient_b])
+
+    def test_recipient_must_be_active_participant(self):
+        self.assertTrue(self.client.login(username="test_admin"))
+
+        for recipient in (self.inactive_participant, self.outsider):
+            topic = f"invalid-recipient-{recipient.username}"
+            response = self._send_private_message(topic, recipient=recipient)
+            self.assertEqual(response.status_code, 200)
+            self.assertFalse(Message.objects.filter(topic=topic).exists())
+
+    def test_group_must_be_attached_to_contest(self):
+        other_group = UserGroup.objects.create(name="other contest group")
+        other_group.owners.add(self.admin)
+        other_group.members.add(self.recipient_a)
+        self.assertTrue(self.client.login(username="test_admin"))
+
+        response = self._send_private_message("other-group-message", groups=(other_group,))
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(Message.objects.filter(topic="other-group-message").exists())
+
+    def test_scheduled_message_is_hidden_until_publication(self):
+        timestamp = datetime(2026, 9, 17, 10, 0, tzinfo=UTC)
+        self.assertTrue(self.client.login(username="test_admin"))
+        with fake_time(timestamp):
+            response = self._send_private_message("scheduled-private-message", recipient=self.recipient_a, pub_date=timestamp + timedelta(hours=1))
+        self.assertEqual(response.status_code, 302)
+
+        message = Message.objects.get(topic="scheduled-private-message")
+        message_url = reverse("message", kwargs={"contest_id": self.contest.id, "message_id": message.id})
+        list_url = reverse("contest_messages", kwargs={"contest_id": self.contest.id})
+
+        self.assertTrue(self.client.login(username="test_user"))
+        with fake_time(message.pub_date - timedelta(seconds=1)):
+            response = self.client.get(list_url)
+            self.assertNotContains(response, message.topic)
+            check_not_accessible(self, message_url)
+        with fake_time(message.pub_date):
+            response = self.client.get(list_url)
+            self.assertContains(response, message.topic)
+            self.assertEqual(self.client.get(message_url).status_code, 200)
+
+    def test_recipients_can_only_be_changed_before_publication(self):
+        timestamp = datetime(2026, 9, 17, 10, 0, tzinfo=UTC)
+        self.assertTrue(self.client.login(username="test_admin"))
+        with fake_time(timestamp):
+            response = self._send_private_message("editable-private-message", recipient=self.recipient_a, pub_date=timestamp + timedelta(hours=1))
+        self.assertEqual(response.status_code, 302)
+        message = Message.objects.get(topic="editable-private-message")
+
+        with fake_time(message.pub_date - timedelta(seconds=1)):
+            response = self._edit_private_message(message, recipient=self.recipient_b)
+        self.assertEqual(response.status_code, 302)
+        message.refresh_from_db()
+        self.assertQuerySetEqual(message.recipients.all(), [self.recipient_b])
+
+        with fake_time(message.pub_date):
+            response = self._edit_private_message(message, recipient=self.recipient_a)
+        self.assertEqual(response.status_code, 200)
+        message.refresh_from_db()
+        self.assertQuerySetEqual(message.recipients.all(), [self.recipient_b])
+
+    def test_immediate_message_recipients_cannot_be_changed(self):
+        self.assertTrue(self.client.login(username="test_admin"))
+        response = self._send_private_message("immediate-private-message", recipient=self.recipient_a)
+        self.assertEqual(response.status_code, 302)
+        message = Message.objects.get(topic="immediate-private-message")
+
+        response = self._edit_private_message(message, recipient=self.recipient_b)
+        self.assertEqual(response.status_code, 200)
+        message.refresh_from_db()
+        self.assertQuerySetEqual(message.recipients.all(), [self.recipient_a])
+
+    def test_group_members_are_snapshotted_on_each_explicit_save(self):
+        timestamp = datetime(2026, 9, 17, 10, 0, tzinfo=UTC)
+        self.assertTrue(self.client.login(username="test_admin"))
+        with fake_time(timestamp):
+            response = self._send_private_message("snapshotted-private-message", groups=(self.group,), pub_date=timestamp + timedelta(hours=1))
+        self.assertEqual(response.status_code, 302)
+        message = Message.objects.get(topic="snapshotted-private-message")
+        self.assertQuerySetEqual(message.recipients.order_by("username"), [self.recipient_a, self.recipient_b])
+
+        self.group.members.remove(self.recipient_a)
+        self.group.members.add(self.inactive_participant)
+        participant = Participant.objects.get(contest=self.contest, user=self.inactive_participant)
+        participant.status = "ACTIVE"
+        participant.save()
+        self.assertQuerySetEqual(message.recipients.order_by("username"), [self.recipient_a, self.recipient_b])
+
+        with fake_time(message.pub_date - timedelta(seconds=1)):
+            response = self._edit_private_message(message, groups=(self.group,))
+        self.assertEqual(response.status_code, 302)
+        message.refresh_from_db()
+        self.assertQuerySetEqual(message.recipients.order_by("username"), [self.recipient_b, self.inactive_participant])
+
+    def test_group_replies_create_separate_private_conversations(self):
+        self.assertTrue(self.client.login(username="test_admin"))
+        response = self._send_private_message("group-private-message", groups=(self.group,))
+        self.assertEqual(response.status_code, 302)
+        message = Message.objects.get(topic="group-private-message")
+        message_url = reverse("message", kwargs={"contest_id": self.contest.id, "message_id": message.id})
+
+        reply_a = self._reply("test_user", message_url, "reply-a")
+        admin_reply_a = self._reply("test_admin", reply_a.get_absolute_url(), "admin-reply-a")
+        self._reply("test_user", message_url, "second-reply-a")
+        self._reply("test_admin", admin_reply_a.get_absolute_url(), "second-admin-reply-a")
+        reply_b = self._reply("test_user2", message_url, "reply-b")
+        self._reply("test_admin", reply_b.get_absolute_url(), "admin-reply-b")
+
+        self.assertTrue(self.client.login(username="test_user"))
+        response = self.client.get(message_url)
+        self.assertContains(response, "group-private-message-body")
+        self.assertContains(response, "reply-a-body")
+        self.assertContains(response, "admin-reply-a-body")
+        self.assertContains(response, "second-reply-a-body")
+        self.assertContains(response, "second-admin-reply-a-body")
+        self.assertNotContains(response, "reply-b-body")
+        self.assertNotContains(response, "admin-reply-b-body")
+
+        self.assertTrue(self.client.login(username="test_user2"))
+        response = self.client.get(message_url)
+        self.assertContains(response, "group-private-message-body")
+        self.assertContains(response, "reply-b-body")
+        self.assertContains(response, "admin-reply-b-body")
+        self.assertNotContains(response, "reply-a-body")
+        self.assertNotContains(response, "admin-reply-a-body")
+
+        self.assertTrue(self.client.login(username="test_admin"))
+        response = self.client.get(reply_a.get_absolute_url())
+        self.assertContains(response, "reply-a-body")
+        self.assertContains(response, "admin-reply-a-body")
+        self.assertNotContains(response, "reply-b-body")
+        response = self.client.get(reply_b.get_absolute_url())
+        self.assertContains(response, "reply-b-body")
+        self.assertContains(response, "admin-reply-b-body")
+        self.assertNotContains(response, "reply-a-body")
+
+        self.assertTrue(self.client.login(username="other_participant"))
+        check_not_accessible(self, message_url)
 
 
 class TestAllMessagesView(TestCase):
